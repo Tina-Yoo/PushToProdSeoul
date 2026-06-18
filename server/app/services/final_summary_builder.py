@@ -140,10 +140,13 @@ def _repair_content(damage_type_labels: list[str], repair_type_labels: list[str]
 def _is_included_in_estimate(panel_data: dict) -> bool:
     verdict = panel_data.get("claude_verdict")
     if not verdict:
-        return True  # default: include
-    agree = verdict.get("agree")
+        return True
+    # actual format uses "overall_agree"; spec format uses "agree"
+    agree = verdict.get("overall_agree")
     if agree is None:
-        return True  # not specified: include
+        agree = verdict.get("agree")
+    if agree is None:
+        return True
     return bool(agree)
 
 
@@ -160,12 +163,19 @@ def _unit_price(repair_types: list[str], vehicle_category: str) -> int | None:
 
 
 def _requires_review_reasons(panel_data: dict) -> list[str]:
-    raw = panel_data.get("requires_review_reasons") or []
+    # actual format: requires_review = {"reasons": [{source, reason}, ...]}
+    # spec format:   requires_review_reasons = [{source, reason}, ...]
+    rr = panel_data.get("requires_review")
+    if isinstance(rr, dict):
+        raw = rr.get("reasons") or []
+    else:
+        raw = panel_data.get("requires_review_reasons") or []
+
     result = []
     for r in raw:
         if isinstance(r, dict):
-            reason = r.get("reason") or ""
             source = r.get("source") or ""
+            reason = r.get("reason") or ""
             result.append(f"{source}: {reason}" if source else reason)
         else:
             result.append(str(r))
@@ -183,14 +193,22 @@ def _build_damage_section(section_no: int, panel_data: dict) -> DamageSection:
     dt_labels = _damage_labels(damage_types)
     rt_labels = _repair_labels(repair_types)
 
-    confidence = verdict.get("confidence")
+    # actual format: overall_confidence / overall_reasoning
+    # spec format:   confidence / reasoning
+    confidence = verdict.get("overall_confidence") if verdict.get("overall_confidence") is not None else verdict.get("confidence")
+    reasoning = verdict.get("overall_reasoning") or verdict.get("reasoning")
     confidence_percent = round(confidence * 100) if confidence is not None else None
 
+    # evidence_images: list of strings (actual) or list of dicts (spec)
+    raw_evidence = verdict.get("evidence_images") or []
     evidence_images = [
-        EvidenceImage(image_name=img)
-        for img in (verdict.get("evidence_images") or [])
+        EvidenceImage(image_name=img) if isinstance(img, str)
+        else EvidenceImage(image_name=img.get("image_name", ""))
+        for img in raw_evidence
     ]
 
+    # damage_verdicts: "damage_type_verdicts" (actual) or "damage_verdicts" (spec)
+    raw_verdicts = verdict.get("damage_type_verdicts") or verdict.get("damage_verdicts") or []
     damage_verdicts = [
         DamageVerdict(
             damage_type=dv.get("damage_type", ""),
@@ -198,8 +216,17 @@ def _build_damage_section(section_no: int, panel_data: dict) -> DamageSection:
             confidence=dv.get("confidence"),
             reasoning=dv.get("reasoning"),
         )
-        for dv in (verdict.get("damage_verdicts") or [])
+        for dv in raw_verdicts
     ]
+
+    # damage_confidences: compute from verdicts if not directly provided
+    damage_confidences: dict = verdict.get("damage_confidences") or {}
+    if not damage_confidences and raw_verdicts:
+        damage_confidences = {
+            dv["damage_type"]: dv["confidence"]
+            for dv in raw_verdicts
+            if dv.get("damage_type") and dv.get("confidence") is not None
+        }
 
     requires_review_reasons = _requires_review_reasons(panel_data)
 
@@ -214,10 +241,10 @@ def _build_damage_section(section_no: int, panel_data: dict) -> DamageSection:
         repair_type_labels=rt_labels,
         confidence=confidence,
         confidence_percent=confidence_percent,
-        reasoning=verdict.get("reasoning"),
+        reasoning=reasoning,
         comment_claim_id=verdict.get("comment_corroboration"),
         evidence_images=evidence_images,
-        damage_confidences=verdict.get("damage_confidences") or {},
+        damage_confidences=damage_confidences,
         damage_verdicts=damage_verdicts,
         requires_review=bool(requires_review_reasons),
         requires_review_reasons=requires_review_reasons,
@@ -281,11 +308,11 @@ def build_final_summary(request: FinalSummaryRequest) -> FinalSummaryResponse:
         pending_inputs.append("valid_vehicle_category")
 
     # Validate vision result structure
-    vision_data: dict = {}
+    vision_raw: dict = {}
     if not request.claude_vision_check_result:
         pending_inputs.append("claude_vision_check_result")
     else:
-        vision_data = request.claude_vision_check_result.get("data") or {}
+        vision_raw = request.claude_vision_check_result
 
     base_document_info = DocumentInfo(
         document_no=request.document_no,
@@ -307,16 +334,30 @@ def build_final_summary(request: FinalSummaryRequest) -> FinalSummaryResponse:
             pending_inputs=pending_inputs,
         )
 
-    # ── Extract from vision result ────────────────────────────────────────────
-    meta: dict = vision_data.get("meta") or {}
+    # ── Detect format and extract fields ─────────────────────────────────────
+    # spec format:   {status, data: {estimate_id, meta: {damaged_panels, ...}}}
+    # actual format: {estimate_id, overall_status, damaged_panels, geometry_images, ...}
+    if "data" in vision_raw:
+        inner: dict = vision_raw.get("data") or {}
+        meta: dict = inner.get("meta") or {}
+        vision_estimate_id: str | None = inner.get("estimate_id")
+    else:
+        inner = vision_raw
+        meta = vision_raw
+        vision_estimate_id = vision_raw.get("estimate_id")
+
     damaged_panels: list[dict] = meta.get("damaged_panels") or []
-    geometry_images: list = meta.get("geometry_info", {}).get("geometry_images") or []
+
+    # geometry images: spec path vs actual path
+    geometry_images: list = (meta.get("geometry_info") or {}).get("geometry_images") or []
+    if not geometry_images:
+        geometry_images = (vision_raw.get("geometry_images") or {}).get("damage_assessment") or []
+
     comment_claims: list = meta.get("comment_claims") or []
 
-    # Merge vehicle_info: vision result < request (request wins)
+    # vehicle_info: request overrides vision result
     vision_vehicle: dict = meta.get("vehicle_info") or {}
     req_vi = request.vehicle_info
-
     vehicle_no = (req_vi.vehicle_no if req_vi else None) or vision_vehicle.get("vehicle_no")
     vehicle_name = (req_vi.vehicle_name if req_vi else None) or vision_vehicle.get("vehicle_name")
 
@@ -348,7 +389,7 @@ def build_final_summary(request: FinalSummaryRequest) -> FinalSummaryResponse:
     # ── Build estimate sheet ──────────────────────────────────────────────────
     estimate_sheet = _build_estimate_sheet(damage_sections, request.vehicle_category)
 
-    estimate_id = request.estimate_id or vision_data.get("estimate_id")
+    estimate_id = request.estimate_id or vision_estimate_id
 
     return FinalSummaryResponse(
         estimate_id=estimate_id,
